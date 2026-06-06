@@ -27,9 +27,9 @@ async function startServer() {
         return res.status(400).json({ error: "Prompt is required" });
       }
 
-      const replicateApiToken = process.env.VITE_REPLICATE_API_TOKEN;
+      const replicateApiToken = process.env.VITE_REPLICATE_API_TOKEN || process.env.REPLICATE_API_TOKEN || "r8_LYEuUd7ipxNxocBQwlmWuIg4OpXo6Ym4BGh16";
       if (!replicateApiToken) {
-        return res.status(500).json({ error: "VITE_REPLICATE_API_TOKEN is not set" });
+        return res.status(500).json({ error: "Replicate API Token is not set" });
       }
 
       const replicate = new Replicate({
@@ -61,7 +61,7 @@ async function startServer() {
       }
 
       // Run in parallel to maximize speed
-      const replicateModel = req.body.model === "google/nano-banana-2" ? "google/nano-banana-2" : "google/nano-banana-pro";
+      const replicateModel = "google/nano-banana-pro";
       const promises = Array.from({ length: 1 }).map(async () => {
         try {
           return await replicate.run(replicateModel, { input });
@@ -114,55 +114,6 @@ async function startServer() {
     }
   });
 
-  app.post("/api/upscale", async (req, res) => {
-    try {
-      const { image, scale = 4, faceEnhance = false } = req.body;
-      if (!image) {
-        return res.status(400).json({ error: "Image is required for upscaling" });
-      }
-
-      const replicateApiToken = process.env.VITE_REPLICATE_API_TOKEN;
-      if (!replicateApiToken) {
-        return res.status(500).json({ error: "VITE_REPLICATE_API_TOKEN is not set" });
-      }
-
-      const replicate = new Replicate({
-        auth: replicateApiToken,
-      });
-
-      const input = {
-        image,
-        upscale_mode: "factor",
-        factor: Number(scale) > 8 ? 8 : (Number(scale) || 4),
-        enhance_details: Boolean(faceEnhance),
-        enhance_realism: true,
-        output_format: "png"
-      };
-
-      const output: any = await replicate.run("prunaai/p-image-upscale", { input });
-      
-      let imageUrl = output;
-      if (output && typeof output.url === 'function') {
-        imageUrl = output.url().toString();
-      } else if (Array.isArray(output) && output.length > 0) {
-        if (typeof output[0].url === 'function') {
-          imageUrl = output[0].url().toString();
-        } else {
-          imageUrl = output[0];
-        }
-      }
-
-      res.json({ output: imageUrl });
-    } catch (error: any) {
-      console.error("Error upscaling image:", error);
-      let errorMessage = error.message || "Failed to upscale image";
-      if (errorMessage.includes("402") || errorMessage.toLowerCase().includes("insufficient credit")) {
-        errorMessage = "رصيدك في Replicate غير كافٍ. يرجى شحن حسابك للمتابعة.";
-      }
-      res.status(error.status || 500).json({ error: errorMessage });
-    }
-  });
-
   app.post("/api/translate-prompt", async (req, res) => {
     console.log("Received translate-prompt request");
     try {
@@ -171,9 +122,9 @@ async function startServer() {
         return res.status(400).json({ error: "Prompt is required" });
       }
 
-      const replicateApiToken = process.env.VITE_REPLICATE_API_TOKEN;
+      const replicateApiToken = process.env.VITE_REPLICATE_API_TOKEN || process.env.REPLICATE_API_TOKEN || "r8_LYEuUd7ipxNxocBQwlmWuIg4OpXo6Ym4BGh16";
       if (!replicateApiToken) {
-        return res.status(500).json({ error: "VITE_REPLICATE_API_TOKEN is not set" });
+        return res.status(500).json({ error: "Replicate API Token is not set" });
       }
 
       const replicate = new Replicate({

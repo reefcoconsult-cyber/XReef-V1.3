@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect } from "react";
 import { useParams, useNavigate } from 'react-router-dom';
-import { Loader2, Image as ImageIcon, Upload, X, Download, Sparkles, ChevronDown, ChevronUp, Maximize2, Clock, Trash2, Crop, Zap, ImagePlus, Library, Edit2, Plus, Save, LayoutTemplate, Settings2, LogIn, LogOut, Mail, Lock, UserPlus, ArrowLeft, LifeBuoy, Wand2, Folder } from "lucide-react";
+import { Loader2, Image as ImageIcon, Upload, X, Download, Sparkles, ChevronDown, ChevronUp, Maximize2, Clock, Trash2, Crop, Zap, ImagePlus, Library, Edit2, Plus, Save, LayoutTemplate, Settings2, LogIn, LogOut, Mail, Lock, UserPlus, ArrowLeft, LifeBuoy, Wand2, Folder, Video } from "lucide-react";
 import ReactCrop, { type Crop as CropType } from 'react-image-crop';
 import 'react-image-crop/dist/ReactCrop.css';
-import { auth, db, signInWithGoogle, signInWithEmail, signUpWithEmail, logOut, handleFirestoreError, OperationType } from '../firebase';
+import { auth, db, signInWithGoogle, signInWithEmail, signUpWithEmail, logOut, handleFirestoreError, OperationType, getAccessToken, initAuth } from '../firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
 import { collection, doc, setDoc, onSnapshot, query, orderBy, deleteDoc } from 'firebase/firestore';
 import { motion, AnimatePresence } from 'motion/react';
@@ -62,11 +62,13 @@ export default function ProjectWorkspace() {
   const { projectId } = useParams();
   const navigate = useNavigate();
   const [prompt, setPrompt] = useState("");
+  
   const [imageFiles, setImageFiles] = useState<string[]>([]);
   const [imageUrls, setImageUrls] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Advanced Settings State
   const [aspectRatio, setAspectRatio] = useState("16:9");
@@ -74,6 +76,11 @@ export default function ProjectWorkspace() {
   
   // Fullscreen State
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+
+  // Google Drive State
+  const [needsDriveAuth, setNeedsDriveAuth] = useState(false);
+  const [isSavingToDrive, setIsSavingToDrive] = useState(false);
+  const [driveSavedSuccess, setDriveSavedSuccess] = useState<string | null>(null);
 
   // Cropping State
   const [imageToCrop, setImageToCrop] = useState<string | null>(null);
@@ -124,12 +131,14 @@ export default function ProjectWorkspace() {
   const [imageToTemplate, setImageToTemplate] = useState<string | null>(null);
   const templateCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  const [sidebarMode, setSidebarMode] = useState<'generate' | 'generate_nano_2' | 'upscale'>('generate');
-  const [upscaleSourceImage, setUpscaleSourceImage] = useState<string | null>(null);
-  const [isUpscalingLocal, setIsUpscalingLocal] = useState(false);
-  const upscaleFileInputRef = useRef<HTMLInputElement>(null);
+  const [sidebarMode, setSidebarMode] = useState<'generate'>('generate');
 
   useEffect(() => {
+    initAuth(
+      () => setNeedsDriveAuth(false),
+      () => setNeedsDriveAuth(true)
+    );
+
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
       setIsAuthReady(true);
@@ -222,6 +231,10 @@ export default function ProjectWorkspace() {
     } catch (err: any) {
       if (err.code === 'auth/operation-not-allowed') {
         setAuthError("تسجيل الدخول بحساب Google غير مفعل في لوحة تحكم Firebase.");
+      } else if (err.code === 'auth/popup-closed-by-user') {
+        setAuthError("تم إغلاق النافذة قبل اكتمال التسجيل. يرجى المحاولة مرة أخرى.");
+      } else if (err.code === 'auth/admin-restricted-operation') {
+        setAuthError("العملية مقيدة. تأكد من إعدادات نطاق OAuth في Google Cloud.");
       } else {
         setAuthError("حدث خطأ أثناء تسجيل الدخول بحساب Google.");
       }
@@ -552,6 +565,32 @@ export default function ProjectWorkspace() {
     }
   };
 
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const files = e.dataTransfer.files;
+    if (files && files.length > 0 && files[0].type.startsWith('image/')) {
+      try {
+        const compressedBase64 = await compressImage(files[0]);
+        setImageFiles([compressedBase64]);
+        setError(null);
+      } catch (err) {
+        console.error("Error compressing image:", err);
+        setError("حدث خطأ أثناء معالجة الصورة.");
+      }
+    }
+  };
+
   const removeImage = (index: number) => {
     setImageFiles(prev => prev.filter((_, i) => i !== index));
     if (fileInputRef.current) {
@@ -561,7 +600,9 @@ export default function ProjectWorkspace() {
 
   const handleGenerate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!prompt.trim()) return;
+    
+    let finalPrompt = prompt.trim();
+    if (!finalPrompt) return;
 
     setIsLoading(true);
     setError(null);
@@ -574,11 +615,11 @@ export default function ProjectWorkspace() {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({ 
-          prompt: prompt.trim(), 
+          prompt: finalPrompt, 
           images: imageFiles,
           aspectRatio,
           resolution,
-          model: sidebarMode === "generate_nano_2" ? "google/nano-banana-2" : "google/nano-banana-pro"
+          model: "google/nano-banana-pro"
         }),
       });
 
@@ -719,54 +760,100 @@ export default function ProjectWorkspace() {
     }
   };
 
-  const handleLocalUpscaleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      try {
-        const compressedBase64 = await compressImage(files[0]);
-        setUpscaleSourceImage(compressedBase64);
-      } catch (err) {
-        console.error("Error compressing image:", err);
-      }
-    }
-  };
-
-  const handleLocalUpscale = async () => {
-    if (!upscaleSourceImage) return;
-    setIsUpscalingLocal(true);
+  const handleSaveToDrive = async (imageUrl: string) => {
+    setIsSavingToDrive(true);
+    setDriveSavedSuccess(null);
     try {
-      const response = await fetch("/api/upscale", {
-        method: "POST",
+      const accessToken = await getAccessToken();
+      if (!accessToken) {
+        setNeedsDriveAuth(true);
+        throw new Error("يجب تسجيل الدخول باستخدام حساب Google أولاً.");
+      }
+
+      const res = await fetch(imageUrl);
+      const blob = await res.blob();
+      
+      let folderId = null;
+      try {
+        const q = encodeURIComponent("name='Xreef' and mimeType='application/vnd.google-apps.folder' and trashed=false");
+        const searchRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive`, {
+          headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+        const searchDat = await searchRes.json();
+        
+        if (searchDat.files && searchDat.files.length > 0) {
+          folderId = searchDat.files[0].id;
+        } else {
+          const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              name: 'Xreef',
+              mimeType: 'application/vnd.google-apps.folder'
+            })
+          });
+          const createDat = await createRes.json();
+          folderId = createDat.id;
+        }
+      } catch (err) {
+        console.error("Error finding/creating folder", err);
+      }
+
+      let metadata: any = {
+        name: `Nano_Banana_${Date.now()}.png`,
+        mimeType: 'image/png'
+      };
+      if (folderId) {
+        metadata.parents = [folderId];
+      }
+
+      let form = new FormData();
+      form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+      form.append('file', blob);
+
+      let driveRes = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+        method: 'POST',
         headers: {
-          "Content-Type": "application/json",
+          'Authorization': `Bearer ${accessToken}`,
         },
-        body: JSON.stringify({ 
-          image: upscaleSourceImage,
-          scale: 4,
-          faceEnhance: false
-        }),
+        body: form
       });
 
-      let data;
-      const contentType = response.headers.get("content-type");
-      if (contentType && contentType.includes("application/json")) {
-        data = await response.json();
-      } else {
-        throw new Error("استجابة غير صالحة من الخادم");
-      }
-
-      if (!response.ok) {
-        throw new Error(data.error || "حدث خطأ أثناء تكبير الصورة");
+      if (!driveRes.ok) {
+        // Fallback to root folder if custom folder fails
+        delete metadata.parents;
+        form = new FormData();
+        form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+        form.append('file', blob);
+        
+        driveRes = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+          },
+          body: form
+        });
+        
+        if (!driveRes.ok) {
+           const errorText = await driveRes.text();
+           throw new Error("فشل الحفظ: " + errorText);
+        } else {
+           setDriveSavedSuccess("تم الحفظ في ملفات Drive (مساحتك العامة)");
+           setTimeout(() => setDriveSavedSuccess(null), 3000);
+           return;
+        }
       }
       
-      if (data.output) {
-        setUpscaleSourceImage(data.output);
-      }
+      setDriveSavedSuccess("تم الحفظ في مساحة جوجل درايف بنجاح!");
+      setTimeout(() => setDriveSavedSuccess(null), 3000);
     } catch (err: any) {
-      console.error("Error upscaling local:", err);
-      alert(err.message || "حدث خطأ أثناء تكبير الصورة");
+      console.error(err);
+      alert(err.message || "حدث خطأ غير معروف");
     } finally {
-      setIsUpscalingLocal(false);
+      setIsSavingToDrive(false);
     }
   };
 
@@ -870,6 +957,47 @@ export default function ProjectWorkspace() {
         }
       `}</style>
 
+      {/* Drive Auth Modal */}
+      {needsDriveAuth && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-4 text-right" dir="rtl" onClick={() => setNeedsDriveAuth(false)}>
+          <div className="bg-[#111] p-6 rounded-3xl border border-emerald-500/30 max-w-sm w-full text-center space-y-4 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="w-16 h-16 bg-emerald-500/10 rounded-full flex items-center justify-center mx-auto mb-2 border border-emerald-500/20">
+              <Folder className="w-8 h-8 text-emerald-500" />
+            </div>
+            <h3 className="text-xl font-bold text-white">متطلب Google Drive</h3>
+            <p className="text-sm text-neutral-400 leading-relaxed">لتمكين ميزة حفظ الصور مباشرة في مجلدك الخاص في Google Drive، يرجى الاستمرار وربط حسابك.</p>
+            <div className="pt-2 space-y-2">
+              {authError && <p className="text-xs text-red-400 mb-2">{authError}</p>}
+              <button disabled={isAuthLoading} onClick={async () => {
+                setIsAuthLoading(true);
+                setAuthError(null);
+                try {
+                  await signInWithGoogle();
+                  setNeedsDriveAuth(false);
+                } catch(err: any) {
+                  if (err.code === 'auth/popup-closed-by-user') {
+                    setAuthError("تم إغلاق النافذة قبل اكتمال التسجيل. يرجى المحاولة مرة أخرى.");
+                  } else if (err.code === 'auth/admin-restricted-operation') {
+                    setAuthError("العملية مقيدة. تأكد من إعدادات نطاق OAuth في Google Cloud.");
+                  } else {
+                    setAuthError("حدث خطأ أثناء تسجيل الدخول بحساب Google.");
+                  }
+                  console.error(err);
+                } finally {
+                  setIsAuthLoading(false);
+                }
+              }} className="w-full py-3.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold transition-colors shadow-lg flex justify-center items-center gap-2">
+                {isAuthLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : null}
+                ربط حساب Google
+              </button>
+              <button onClick={() => setNeedsDriveAuth(false)} className="w-full py-3.5 bg-white/5 hover:bg-white/10 text-white rounded-xl font-bold transition-colors">
+                إلغاء
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Auth Modal */}
       {isAuthModalOpen && !user && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-md p-4" onClick={() => setIsAuthModalOpen(false)}>
@@ -934,6 +1062,9 @@ export default function ProjectWorkspace() {
             </button>
             <button onClick={() => { setSelectedImage(null); openCropModal(selectedImage); }} className="flex items-center gap-2 bg-neutral-900/80 hover:bg-neutral-800 text-white px-5 py-3 rounded-full font-medium transition-all shadow-xl border border-white/10 backdrop-blur-md">
                <Crop className="w-4 h-4" /> قص
+            </button>
+            <button onClick={() => handleSaveToDrive(selectedImage)} disabled={isSavingToDrive} className="flex items-center gap-2 bg-emerald-600/90 hover:bg-emerald-500 text-white px-5 py-3 rounded-full font-medium transition-all shadow-xl border border-emerald-500/50 backdrop-blur-md disabled:opacity-50">
+               {isSavingToDrive ? <Loader2 className="w-4 h-4 animate-spin" /> : <Folder className="w-4 h-4" />} درايف
             </button>
             <button onClick={() => handleDownload(selectedImage)} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-6 py-3 rounded-full font-medium transition-all shadow-xl border border-blue-500/50 backdrop-blur-md">
                <Download className="w-5 h-5" /> تنزيل
@@ -1155,7 +1286,7 @@ export default function ProjectWorkspace() {
               <Sparkles className="w-4 h-4 text-white" />
             </div>
             <div className="flex flex-col">
-              <h1 className="font-bold text-base sm:text-lg leading-tight text-white tracking-wide">Xreef <span className="text-blue-400">1.7</span></h1>
+              <h1 className="font-bold text-base sm:text-lg leading-tight text-white tracking-wide">Xreef <span className="text-blue-400">1.8</span></h1>
             </div>
           </div>
           {projectName && (
@@ -1202,34 +1333,8 @@ export default function ProjectWorkspace() {
         
         {/* Right Sidebar (Controls) */}
         <aside className="w-full md:w-[380px] lg:w-[420px] flex-none border-l border-white/5 bg-[#0a0a0a] flex flex-col z-10 md:h-full order-2 md:order-1 relative">
-          
-          {/* Tabs */}
-          <div className="flex items-center border-b border-white/5 shrink-0 overflow-x-auto custom-scrollbar">
-            <button 
-              onClick={() => setSidebarMode('generate')}
-              className={`flex-1 min-w-[120px] flex items-center justify-center gap-2 py-4 text-sm font-semibold transition-colors whitespace-nowrap px-2 ${sidebarMode === 'generate' ? 'text-white border-b-2 border-blue-500 bg-white/5' : 'text-neutral-500 hover:text-white hover:bg-white/5'}`}
-            >
-              <Sparkles className="w-4 h-4" />
-              Pro
-            </button>
-            <button 
-              onClick={() => setSidebarMode('generate_nano_2')}
-              className={`flex-1 min-w-[120px] flex items-center justify-center gap-2 py-4 text-sm font-semibold transition-colors whitespace-nowrap px-2 ${sidebarMode === 'generate_nano_2' ? 'text-white border-b-2 border-green-500 bg-white/5' : 'text-neutral-500 hover:text-white hover:bg-white/5'}`}
-            >
-              <Sparkles className="w-4 h-4 text-green-500" />
-              Banana 2
-            </button>
-            <button 
-              onClick={() => setSidebarMode('upscale')}
-              className={`flex-1 min-w-[120px] flex items-center justify-center gap-2 py-4 text-sm font-semibold transition-colors whitespace-nowrap px-2 ${sidebarMode === 'upscale' ? 'text-white border-b-2 border-purple-500 bg-white/5' : 'text-neutral-500 hover:text-white hover:bg-white/5'}`}
-            >
-              <Zap className="w-4 h-4" />
-              تكبير
-            </button>
-          </div>
 
           <div className="flex-1 overflow-y-auto p-5 sm:p-6 custom-scrollbar">
-            {sidebarMode === 'generate' || sidebarMode === 'generate_nano_2' ? (
               <form onSubmit={handleGenerate} className="space-y-8 pb-32 md:pb-0 relative h-full flex flex-col">
                 
                 {/* Prompt Section */}
@@ -1244,26 +1349,26 @@ export default function ProjectWorkspace() {
                   </button>
                 </div>
                 
-                <div className="relative group">
-                  <textarea
-                    id="prompt"
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                    disabled={isLoading || isEnhancingPrompt}
-                    placeholder="ماذا تريد أن تبدع اليوم؟ (بالعربية أو الإنجليزية)..."
-                    className="w-full bg-[#141414] border border-white/10 text-white rounded-2xl p-4 min-h-[600px] resize-none focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/50 transition-all custom-scrollbar text-sm leading-relaxed font-cairo"
-                  />
-                  <div className="absolute left-3 bottom-3 flex items-center gap-2">
-                    <button type="button" onClick={handleEnhancePrompt} disabled={!prompt.trim() || isEnhancingPrompt || isLoading} className="flex items-center justify-center w-8 h-8 rounded-full bg-purple-500/10 hover:bg-purple-500/20 text-purple-400 border border-purple-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed group/magic" title="ترجمة وتحسين الوصف بواسطة Gemini 3.1">
-                      {isEnhancingPrompt ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4 group-hover/magic:scale-110 transition-transform" />}
-                    </button>
-                    {prompt.trim() && (
-                      <button type="button" onClick={() => setPrompt('')} className="flex items-center justify-center w-8 h-8 rounded-full bg-neutral-800 hover:bg-neutral-700 text-neutral-400 transition-all border border-white/5" title="مسح النص">
-                        <X className="w-4 h-4" />
+                  <div className="relative group">
+                    <textarea
+                      id="prompt"
+                      value={prompt}
+                      onChange={(e) => setPrompt(e.target.value)}
+                      disabled={isLoading || isEnhancingPrompt}
+                      placeholder="ماذا تريد أن تبدع اليوم؟ (بالعربية أو الإنجليزية)..."
+                      className="w-full bg-[#141414] border border-white/10 text-white rounded-2xl p-4 min-h-[600px] resize-none focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/50 transition-all custom-scrollbar text-sm leading-relaxed font-cairo"
+                    />
+                    <div className="absolute left-3 bottom-3 flex items-center gap-2">
+                      <button type="button" onClick={handleEnhancePrompt} disabled={!prompt.trim() || isEnhancingPrompt || isLoading} className="flex items-center justify-center w-8 h-8 rounded-full bg-purple-500/10 hover:bg-purple-500/20 text-purple-400 border border-purple-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed group/magic" title="ترجمة وتحسين الوصف بواسطة Gemini 3.1">
+                        {isEnhancingPrompt ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4 group-hover/magic:scale-110 transition-transform" />}
                       </button>
-                    )}
+                      {prompt.trim() && (
+                        <button type="button" onClick={() => setPrompt('')} className="flex items-center justify-center w-8 h-8 rounded-full bg-neutral-800 hover:bg-neutral-700 text-neutral-400 transition-all border border-white/5" title="مسح النص">
+                          <X className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
-                </div>
 
                 {enhancedPromptResult && (
                   <div className="p-4 bg-purple-900/10 border border-purple-500/20 rounded-2xl animate-in slide-in-from-top-2">
@@ -1295,9 +1400,15 @@ export default function ProjectWorkspace() {
                     </div>
                   </div>
                 ) : (
-                  <div onClick={() => fileInputRef.current?.click()} className="flex flex-col items-center justify-center w-full min-h-[100px] border border-dashed border-white/10 hover:border-indigo-500/50 bg-[#141414] hover:bg-[#1a1a1a] rounded-2xl cursor-pointer transition-all group p-4">
-                    <Upload className="w-6 h-6 text-neutral-600 group-hover:text-indigo-400 transition-colors mb-2" />
-                    <span className="text-xs text-neutral-500 font-medium">سحب وإفلات أو اضغط لرفع صورة</span>
+                  <div 
+                    onClick={() => fileInputRef.current?.click()} 
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    className={`flex flex-col items-center justify-center w-full min-h-[100px] border border-dashed rounded-2xl cursor-pointer transition-all group p-4 ${isDragging ? 'border-indigo-500 bg-indigo-500/10' : 'border-white/10 hover:border-indigo-500/50 bg-[#141414] hover:bg-[#1a1a1a]'}`}
+                  >
+                    <Upload className={`w-6 h-6 mb-2 transition-colors ${isDragging ? 'text-indigo-400' : 'text-neutral-600 group-hover:text-indigo-400'}`} />
+                    <span className={`text-xs font-medium ${isDragging ? 'text-indigo-300' : 'text-neutral-500'}`}>سحب وإفلات أو اضغط لرفع صورة</span>
                   </div>
                 )}
                 <input type="file" ref={fileInputRef} onChange={handleImageUpload} accept="image/*" className="hidden" />
@@ -1361,81 +1472,12 @@ export default function ProjectWorkspace() {
                   ) : (
                     <>
                       <Sparkles className="w-5 h-5" />
-                      <span>{sidebarMode === 'generate_nano_2' ? 'توليد باستخدام Banana 2' : 'توليد إبداع جديد'}</span>
+                      <span>توليد إبداع جديد</span>
                     </>
                   )}
                 </button>
               </div>
             </form>
-            ) : (
-               <div className="space-y-8 pb-32 md:pb-0 relative h-full flex flex-col">
-                  {/* Upscale UI */}
-                  <div className="space-y-3 shrink-0">
-                    <label className="text-sm font-bold text-neutral-200 flex items-center gap-2">
-                       <span className="w-1.5 h-1.5 rounded-full bg-purple-500"></span>
-                       تخطي حدود الدقة مع <span className="font-mono text-purple-400">P-Image-Upscale</span>
-                    </label>
-                    <p className="text-xs text-neutral-400 leading-relaxed mb-4">
-                      ارفع أي صورة لزيادة دقتها وتفاصيلها بشكل ملحوظ باستخدام الذكاء الاصطناعي.
-                    </p>
-                    {upscaleSourceImage ? (
-                      <div className="relative group w-full aspect-square bg-[#141414] rounded-2xl border border-purple-500/30 overflow-hidden flex items-center justify-center">
-                        <img src={upscaleSourceImage} alt="معاينة" className="w-full h-full object-contain" />
-                        <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                          <button type="button" onClick={() => setUpscaleSourceImage(null)} className="bg-red-500/90 text-white p-2.5 rounded-full hover:bg-red-500 hover:scale-110 active:scale-95 transition-all shadow-lg shadow-red-500/20">
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div onClick={() => upscaleFileInputRef.current?.click()} className="flex flex-col items-center justify-center w-full min-h-[300px] border border-dashed border-white/10 hover:border-purple-500/50 bg-[#141414] hover:bg-[#1a1a1a] rounded-2xl cursor-pointer transition-all group p-4">
-                        <Upload className="w-8 h-8 text-neutral-600 group-hover:text-purple-400 transition-colors mb-4" />
-                        <span className="text-sm text-neutral-400 font-medium text-center">سحب وإفلات أو اضغط لرفع صورتك<br/><span className="text-xs text-neutral-600 mt-2 block">يدعم JPG, PNG, WEBP</span></span>
-                      </div>
-                    )}
-                    <input type="file" ref={upscaleFileInputRef} onChange={handleLocalUpscaleImageUpload} accept="image/*" className="hidden" />
-                  </div>
-
-                  <div className="absolute md:relative bottom-0 left-0 right-0 p-5 md:p-0 bg-[#0a0a0a] md:bg-transparent border-t border-white/5 md:border-none z-20 mt-auto pt-6">
-                    <button
-                      type="button"
-                      onClick={handleLocalUpscale}
-                      disabled={isUpscalingLocal || !upscaleSourceImage}
-                      className={`w-full relative overflow-hidden flex items-center justify-center gap-3 py-4 rounded-2xl font-bold text-sm transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed ${
-                        isUpscalingLocal 
-                          ? 'bg-neutral-800 text-neutral-400 border border-white/5' 
-                          : 'bg-gradient-to-r from-purple-600 to-blue-600 text-white hover:opacity-90 shadow-[0_0_40px_-10px_rgba(168,85,247,0.4)] hover:shadow-[0_0_60px_-15px_rgba(168,85,247,0.6)] active:scale-[0.98]'
-                      }`}
-                    >
-                      {isUpscalingLocal ? (
-                        <>
-                          <Loader2 className="w-5 h-5 animate-spin" />
-                          <span>جاري التكبير...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Zap className="w-5 h-5" />
-                          <span>تكبير الدقة وتحسين التفاصيل</span>
-                        </>
-                      )}
-                    </button>
-                    {upscaleSourceImage && !isUpscalingLocal && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const a = document.createElement('a');
-                            a.href = upscaleSourceImage;
-                            a.download = 'upscaled.jpg';
-                            a.click();
-                          }}
-                          className="mt-4 w-full flex items-center justify-center gap-2 py-4 rounded-2xl font-bold text-sm transition-all border border-white/10 bg-[#141414] hover:bg-neutral-800 text-white"
-                        >
-                           <Download className="w-4 h-4" /> تحميل النسخة النهائية
-                        </button>
-                    )}
-                  </div>
-               </div>
-            )}
           </div>
         </aside>
 
@@ -1449,26 +1491,10 @@ export default function ProjectWorkspace() {
            <div className="flex-1 overflow-x-hidden overflow-y-auto custom-scrollbar p-6 lg:p-10 relative z-10 flex flex-col">
               
               {isLoading ? (
-                <div className="m-auto flex flex-col items-center justify-center p-8 max-w-sm w-full">
-                  <div className="relative w-32 h-32 mb-8">
-                     {/* Cybernetic loading ring */}
-                     <div className="absolute inset-0 rounded-full border-t-2 border-l-2 border-blue-500 animate-[spin_2s_linear_infinite]"></div>
-                     <div className="absolute inset-2 rounded-full border-b-2 border-r-2 border-purple-500 animate-[spin_1.5s_linear_infinite_reverse]"></div>
-                     <div className="absolute inset-4 rounded-full border-2 border-dashed border-white/20 animate-[spin_3s_linear_infinite]"></div>
-                     <div className="absolute inset-0 flex items-center justify-center">
-                       <Sparkles className="w-8 h-8 text-white animate-pulse" />
-                     </div>
-                  </div>
-                  <h3 className="text-white font-bold text-lg mb-4 text-center tracking-wide">{loadingText}</h3>
-                  <div className="w-full h-1 bg-neutral-900 rounded-full overflow-hidden border border-white/5">
-                    <div className="h-full bg-gradient-to-r from-blue-500 to-purple-500 transition-all duration-300 ease-out relative" style={{ width: `${progress}%` }}>
-                       <div className="absolute inset-0 bg-[linear-gradient(45deg,transparent_25%,rgba(255,255,255,0.3)_50%,transparent_75%,transparent_100%)] bg-[length:20px_20px] animate-[shimmer_1s_linear_infinite]"></div>
-                    </div>
-                  </div>
-                  <div className="flex justify-between w-full mt-2">
-                     <span className="text-[10px] text-neutral-500 font-mono">0xNANO_BANANA</span>
-                     <span className="text-[10px] text-neutral-400 font-mono font-bold">{progress}%</span>
-                  </div>
+                <div className="m-auto flex flex-col items-center justify-center p-8">
+                  <div className="w-16 h-16 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin mb-6"></div>
+                  <h3 className="text-white font-bold text-lg mb-2 text-center tracking-wide">{loadingText}</h3>
+                  <p className="text-neutral-500 text-sm animate-pulse">{progress}% المكتمل</p>
                 </div>
               ) : imageUrls.length > 0 ? (
                 <div className={`m-auto w-full grid gap-6 md:gap-8 max-w-6xl ${
@@ -1507,10 +1533,18 @@ export default function ProjectWorkspace() {
                             <button onClick={() => openTemplateModal(url)} className="flex items-center justify-center w-10 h-10 bg-indigo-600/90 hover:bg-indigo-500 text-white rounded-xl transition-transform active:scale-95 shadow-lg border border-indigo-400/30 backdrop-blur-sm" title="وضع في قالب">
                               <LayoutTemplate className="w-3.5 h-3.5" />
                             </button>
+                            <button onClick={() => handleSaveToDrive(url)} disabled={isSavingToDrive} className="flex items-center gap-2 bg-emerald-600/90 hover:bg-emerald-500 text-white px-4 py-2.5 rounded-xl text-xs font-bold transition-transform active:scale-95 shadow-lg border border-emerald-400/30 backdrop-blur-sm disabled:opacity-50" title="حفظ في Google Drive">
+                              {isSavingToDrive ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Folder className="w-3.5 h-3.5" />} درايف
+                            </button>
                             <button onClick={() => handleDownload(url)} className="flex items-center justify-center w-10 h-10 bg-white/10 hover:bg-white/20 text-white rounded-xl transition-transform active:scale-95 shadow-lg border border-white/10 backdrop-blur-sm" title="تنزيل">
                               <Download className="w-3.5 h-3.5" />
                             </button>
                          </div>
+                         {driveSavedSuccess && (
+                            <div className="absolute top-2 left-1/2 -translate-x-1/2 text-[10px] text-green-300 bg-green-500/20 border border-green-500/30 px-3 py-1.5 rounded-full shadow-lg backdrop-blur-md whitespace-nowrap">
+                              {driveSavedSuccess}
+                            </div>
+                         )}
                        </div>
                     </motion.div>
                   ))}
